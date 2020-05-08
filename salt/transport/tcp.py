@@ -8,6 +8,7 @@ Wire protocol: "len(payload) msgpack({'head': SOMEHEADER, 'body': SOMEBODY})"
 
 ## Import Python Libs
 from __future__ import absolute_import, print_function, unicode_literals
+import json
 import base64
 import errno
 import logging
@@ -24,7 +25,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
 from tornado.queues import Queue
-
+import tempfile
 
 # Import Salt Libs
 import salt.crypt
@@ -355,7 +356,6 @@ class AsyncTCPReqChannel(salt.transport.client.ReqChannel):
 
 
 def read_file(file_path, queue: Queue, io_loop: IOLoop, chunk_size: int = 64 * 1024):
-    file_size = os.path.getsize(file_path)
     lock = threading.Lock()
 
     def putter(chunk, lock: threading.Lock):
@@ -369,14 +369,31 @@ def read_file(file_path, queue: Queue, io_loop: IOLoop, chunk_size: int = 64 * 1
         lock.acquire()  # Wait until the loop's thread has accepted the chunk for processing
         lock.release()  # Cleanup before return
 
-    with open(file_path, "r") as fin:
+    # Open and watch the event file for changes
+    reader_start = time.time()
+    with open(file_path, "r") as event_file:
         while True:
-            line = fin.readline()
-            if len(line) == 0:
+            serialized_event = event_file.readline()
+            # No data yet, try again later
+            if len(serialized_event) == 0:
                 time.sleep(1)
                 continue
-            print("read", line)
-            put(line, lock)
+            print("read", serialized_event)
+            event = json.loads(serialized_event)
+            print("event", event)
+            contents = None
+            # Only accept events from after we started listening
+            if float(event['timestamp']) < reader_start:
+                print("got old event", event)
+                continue
+            # Read out the entire payload, and put it into the queue
+            with open(event['file'], "r") as tmpfile:
+                contents = tmpfile.read()
+            print("contents", contents)
+            put(contents, lock)
+
+pub_folder = "/tmp/salt-pub/"
+pub_event_file = pub_folder + "event_file"
 
 
 class AsyncTCPPubChannel(
@@ -405,13 +422,13 @@ class AsyncTCPPubChannel(
         # Create a queue for sending chunks of data
         cq = Queue(maxsize=3)
         # Start the reader thread that reads in a separate thread
-        pool.submit(read_file, "/tmp/write_file", cq, self.io_loop)
+        pool.submit(read_file, pub_event_file, cq, self.io_loop)
         # Process chunks
         unpacker = salt.utils.msgpack.Unpacker()
         while True:
             line = yield cq.get()
             payload_string = line
-            bpayload = payload_string.encode('ascii')[:-1]
+            bpayload = payload_string.encode('ascii')
             payload = base64.b64decode(bpayload)
             print("payload", payload, type(payload))
             print("bpayload", bpayload, type(bpayload))
@@ -1175,7 +1192,7 @@ class AbstractPubServerChannel(salt.transport.server.PubServerChannel):
         with salt.utils.files.set_umask(0o177):
             pull_sock.start()
 
-        self.start_server(self.io_loop)
+        self.start_channel(self.io_loop)
 
         try:
             self.io_loop.start()
@@ -1254,21 +1271,50 @@ class AbstractPubServerChannel(salt.transport.server.PubServerChannel):
     def publish_string(self, spayload):
         """Transfer a string to the minions."""
         raise NotImplemented()
- 
+
 
 class TCPPubServerChannel(AbstractPubServerChannel):
     """File-based PubServerChannel.
 
     This implementation serves solely as a minimal example for how to implement
-    the PubServerChannel. It utilizes a single file as backend, and as such
-    cannot distingush multiple minions apart.
-    """
+    the PubSererChannel.
 
-    def start_server(self, io_loop):
-        """Starting the server is just emptying out our communication file."""
-        open('/tmp/write_file', 'w').close()
+    It utilizes a single file as an event bus notifying minions whenever new
+    data is available, and creates a temporary files for each transfer.
+
+    Minions read the event bus file, and reacts to events by reading the
+    temporary file containing the actual message.
+    """
+    def start_channel(self, io_loop):
+        """Start communications channel.
+
+        Starting the channel is creating the communications folder, and
+        emptying out the event file.
+        """
+        # Create folder if it does not exist
+        try:
+            os.mkdir(pub_folder)
+        except FileExistsError:
+            pass
+        # Clear out file
+        open(pub_event_file, 'w').close()
 
     def publish_string(self, spayload):
-        """Publishing the command, is just appending the payload to the file."""
-        with open('/tmp/write_file', 'a') as output:
-            output.write(spayload + "\n")
+        """Transfer a string to the minions.
+
+        The transfer involves two steps.
+        1. Create a temporary file, with the payload.
+        2. Signal an event to minions, that a new temporary file has been
+           created, and should be consumed.
+        """
+        payload_filename = None
+        with tempfile.NamedTemporaryFile(mode="w", dir=pub_folder, delete=False) as tmpfile:
+            payload_filename = tmpfile.name
+            tmpfile.write(spayload)
+
+        event = {
+            "timestamp": str(time.time()),
+            "file": str(payload_filename)
+        }
+        with open(pub_event_file, "a") as event_file:
+            event_file.write(json.dumps(event) + "\n")
