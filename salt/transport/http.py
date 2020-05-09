@@ -34,6 +34,177 @@ else:
     import urllib.parse
     urlencode = urllib.parse.urlencode
 
+# pylint: disable=import-error,no-name-in-module
+if six.PY2:
+    import urlparse
+else:
+    import urllib.parse as urlparse
+# pylint: enable=import-error,no-name-in-module
+
+
+class AsyncHTTPReqChannel(salt.transport.abstract.AbstractAsyncReqChannel):
+    def __new__(cls, opts, **kwargs):
+        return super().__new__(cls, opts, **kwargs)
+
+    @classmethod
+    def __key(cls, opts, **kwargs):
+        return super().__key(cls, opts, **kwargs)
+
+    def start_channel(self, io_loop, **kwargs):
+        parse = urlparse.urlparse(self.opts["master_uri"])
+        master_host, master_port = parse.netloc.rsplit(":", 1)
+        self.url = "http://" + master_host + ":" + str(master_port) + "/req"
+        self.http_client = salt.ext.tornado.httpclient.AsyncHTTPClient(io_loop=self.io_loop)
+
+    def close(self):
+        super().close()
+        if hasattr(self, "http_client"):
+            self.http_client.close()
+
+    def publish_string(self, spayload):
+        post_data = {"payload": spayload}
+        body = urlencode(post_data)
+        http_request = salt.ext.tornado.httpclient.HTTPRequest(self.url, method="POST", headers=None, body=body)
+        print("!!", __class__, "spayload:", spayload)
+
+        return_future = salt.ext.tornado.gen.Future()
+        def callback(response):
+            if response.error:
+                print("!!", __class__, "Error:", response.error)
+            else:
+                print("!!", __class__, "callback:", response.body)
+                spayload = response.body
+                b64payload = spayload.decode("ascii")
+                bpayload = base64.b64decode(b64payload)
+                unpacker = salt.utils.msgpack.Unpacker()
+                unpacker.feed(bpayload)
+                for framed_msg in unpacker:
+                    if six.PY3:
+                        framed_msg = salt.transport.frame.decode_embedded_strs(
+                            framed_msg
+                        )
+                    header = framed_msg['head']
+                    payload = framed_msg['body']
+                    print("!!", __class__, "framed_msg:", framed_msg)
+                    return_future.set_result(payload)
+                return
+            return_future.set_result(None)
+        self.http_client.fetch(http_request, callback)
+
+        return return_future
+
+
+class MessageRequestHandler(salt.ext.tornado.web.RequestHandler):
+    """Long-polling request for new messages.
+    Waits until new messages are available before returning anything.
+    """
+
+    def initialize(self, callback):
+        self.callback = callback
+
+    async def post(self):
+        spayload = self.get_argument("payload")
+        print("!!", __class__, "payload:", spayload)
+        b64payload = spayload.encode("ascii")
+        bpayload = base64.b64decode(b64payload)
+        unpacker = salt.utils.msgpack.Unpacker()
+        unpacker.feed(bpayload)
+        for framed_msg in unpacker:
+            if six.PY3:
+                framed_msg = salt.transport.frame.decode_embedded_strs(
+                    framed_msg
+                )
+            print("!!", __class__, "framed_msg:", framed_msg)
+            # header = framed_msg["head"]
+            # payload = framed_msg["body"]
+            self.callback(None, framed_msg, handler=self)
+
+    def on_connection_close(self):
+        self.wait_future.cancel()
+
+
+class HTTPReqServerChannel(salt.transport.abstract.AbstractReqServerChannel):
+    # TODO: opts!
+    backlog = 5
+
+    def __init__(self, opts):
+        super().__init__(opts)
+        self.xsocket = None
+
+    @property
+    def socket(self):
+        return self.xsocket
+
+    def close(self):
+        super().close()
+        if self.xsocket is not None:
+            try:
+                self.xsocket.shutdown(socket.SHUT_RDWR)
+            except socket.error as exc:
+                if exc.errno == errno.ENOTCONN:
+                    # We may try to shutdown a socket which is already disconnected.
+                    # Ignore this condition and continue.
+                    pass
+                else:
+                    six.reraise(*sys.exc_info())
+            self.xsocket.close()
+            self.xsocket = None
+        if hasattr(self.http_server, "shutdown"):
+            try:
+                self.http_server.shutdown()
+            except Exception as exc:  # pylint: disable=broad-except
+                log.exception(
+                    "HTTPReqServerChannel close generated an exception: %s", str(exc)
+                )
+        elif hasattr(self.http_server, "stop"):
+            self.http_server.stop()
+
+    def _start_socket(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _set_tcp_keepalive(sock, self.opts)
+        sock.setblocking(0)
+        sock.bind((self.opts["interface"], int(self.opts["ret_port"])))
+        return sock
+
+    def pre_fork(self, process_manager):
+        super().pre_fork(process_manager)
+        self.xsocket = self._start_socket()
+
+    def start_channel(self, io_loop):
+        """Start channel for minions to connect to.
+
+        Whenever a message is received process_message should be called with
+        the decoded message.
+        """
+        with salt.utils.asynchronous.current_ioloop(io_loop):
+            app = salt.ext.tornado.web.Application(
+                [
+                    (r"/req", MessageRequestHandler, {'callback': self.process_message}),
+                ],
+            )
+            self.http_server = salt.ext.tornado.httpserver.HTTPServer(app, io_loop=self.io_loop)
+            self.http_server.add_socket(self.xsocket)
+            self.xsocket.listen(self.backlog)
+
+    def write_string(self, spayload, handler):
+        """Send bytes back to minion as response.
+
+        The kwargs provided to this function are the same start_channel passes
+        to process_message to process receieved messages.
+
+        This must implemented assuming the write_bytes method is not.
+        """
+        handler.write(spayload)
+
+    def shutdown_processor(self, handler):
+        """Shutdown the specific minion response channel.
+
+        The kwargs provided to this function are the same start_channel passes
+        to process_message to process receieved messages.
+        """
+        handler.close()
+
 
 class AsyncHTTPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
     # TODO: Handle minion connection state
@@ -57,7 +228,6 @@ class AsyncHTTPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
         self.publish_ip = self.opts["master_ip"]
         # TODO: Initial request should just fetch last_message_id?
         self.url = "http://" + self.publish_ip + ":" + str(self.publish_port) + "/message/updates"
-        self.http_client = salt.ext.tornado.httpclient.AsyncHTTPClient(io_loop=self.io_loop)
         self._fire_http_request()
 
     def _fire_http_request(self, cursor=None):
@@ -66,6 +236,7 @@ class AsyncHTTPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
             post_data["cursor"] = cursor
         body = urlencode(post_data)
         http_request = salt.ext.tornado.httpclient.HTTPRequest(self.url, method="POST", headers=None, body=body)
+        self.http_client = salt.ext.tornado.httpclient.AsyncHTTPClient(io_loop=self.io_loop)
         self.http_client.fetch(http_request, self._handle_response)
 
     def _handle_response(self, response):
@@ -162,6 +333,12 @@ class HTTPPubServerChannel(salt.transport.abstract.AbstractPubServerChannel):
     # TODO: opts!
     # Based on default used in salt.ext.tornado.netutil.bind_sockets()
     backlog = 128
+
+    def close(self):
+        super().close()
+        if self.http_server:
+            self.http_server.close()
+            self.http_server = None
 
     def _start_socket(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
