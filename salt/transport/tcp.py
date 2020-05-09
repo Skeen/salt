@@ -3,7 +3,6 @@
 TCP transport classes
 
 Wire protocol: "len(payload) msgpack({'head': SOMEHEADER, 'body': SOMEBODY})"
-
 """
 
 # Import Python Libs
@@ -278,14 +277,106 @@ class AsyncTCPReqChannel(salt.transport.abstract.AbstractAsyncReqChannel):
 class AsyncTCPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
     def close(self):
         super().close()
+        if self._closing:
+            return
         if hasattr(self, "message_client"):
             self.message_client.close()
 
-    def write_to_stream(self, package):
-        return self.message_client.write_to_stream(package)
+    @salt.ext.tornado.gen.coroutine
+    def connect_callback(self, result):
+        if self._closing:
+            return
+        # Force re-auth on reconnect since the master
+        # may have been restarted
+        yield self.send_id(self.tok, self._reconnected)
+        self.connected = True
+        self.event.fire_event({"master": self.opts["master"]}, "__master_connected")
+        if self._reconnected:
+            # On reconnects, fire a master event to notify that the minion is
+            # available.
+            if self.opts.get("__role") == "syndic":
+                data = "Syndic {0} started at {1}".format(
+                    self.opts["id"], time.asctime()
+                )
+                tag = salt.utils.event.tagify([self.opts["id"], "start"], "syndic")
+            else:
+                data = "Minion {0} started at {1}".format(
+                    self.opts["id"], time.asctime()
+                )
+                tag = salt.utils.event.tagify([self.opts["id"], "start"], "minion")
+            load = {
+                "id": self.opts["id"],
+                "cmd": "_minion_event",
+                "pretag": None,
+                "tok": self.tok,
+                "data": data,
+                "tag": tag,
+            }
+            req_channel = salt.utils.asynchronous.SyncWrapper(
+                self.get_async_req_channel_class(), (self.opts,)
+            )
+            try:
+                req_channel.send(load, timeout=60)
+            except salt.exceptions.SaltReqTimeoutError:
+                log.info(
+                    "fire_master failed: master could not be contacted. Request timed out."
+                )
+            except Exception:  # pylint: disable=broad-except
+                log.info("fire_master failed: %s", traceback.format_exc())
+            finally:
+                # SyncWrapper will call either close() or destroy(), whichever is available
+                del req_channel
+        else:
+            self._reconnected = True
 
-    def get_async_req_channel_class(self):
-        return AsyncTCPReqChannel
+    def _package_load(self, load):
+        return {
+            "enc": self.crypt,
+            "load": load,
+        }
+
+    @salt.ext.tornado.gen.coroutine
+    def send_id(self, tok, force_auth):
+        """
+        Send the minion id to the master so that the master may better
+        track the connection state of the minion.
+        In case of authentication errors, try to renegotiate authentication
+        and retry the method.
+        """
+        load = {"id": self.opts["id"], "tok": tok}
+
+        @salt.ext.tornado.gen.coroutine
+        def _do_transfer():
+            msg = self._package_load(self.auth.crypticle.dumps(load))
+            package = salt.transport.frame.frame_msg(msg, header=None)
+            yield self.write_to_stream(package)
+            raise salt.ext.tornado.gen.Return(True)
+
+        if force_auth or not self.auth.authenticated:
+            count = 0
+            while (
+                count <= self.get_authentification_retries() or
+                self.get_authentificiation_retries() < 0
+            ):
+                try:
+                    yield self.auth.authenticate()
+                    break
+                except SaltClientError as exc:
+                    log.debug(exc)
+                    count += 1
+        try:
+            ret = yield _do_transfer()
+            raise salt.ext.tornado.gen.Return(ret)
+        except salt.crypt.AuthenticationError:
+            yield self.auth.authenticate()
+            ret = yield _do_transfer()
+            raise salt.ext.tornado.gen.Return(ret)
+
+    def disconnect_callback(self):
+        if self._closing:
+            return
+        self.connected = False
+        self.event.fire_event({"master": self.opts["master"]}, "__master_disconnected")
 
     @salt.ext.tornado.gen.coroutine
     def open_connection(self):
@@ -309,8 +400,17 @@ class AsyncTCPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
         )
         return self.message_client.connect()  # wait for the client to be connected
 
+    def write_to_stream(self, package):
+        return self.message_client.write_to_stream(package)
+
+    def get_async_req_channel_class(self):
+        return AsyncTCPReqChannel
+
     def set_callback(self, callback):
         return self.message_client.on_recv(callback)
+
+    def get_authentification_retries(self):
+        return self.opts["tcp_authentication_retries"]
 
 
 class TCPReqServerChannel(salt.transport.abstract.AbstractReqServerChannel):
@@ -404,11 +504,8 @@ class TCPReqServerChannel(salt.transport.abstract.AbstractReqServerChannel):
     def handle_message(self, stream, header, payload):
         return self.process_message(header, payload, stream=stream)
 
-    def write_back(self, message, stream):
-        stream.write(message)
-
-    def send_back(self, message, stream):
-        stream.send(message)
+    def write_bytes(self, message, stream):
+        return stream.write(message)
 
     def shutdown(self, stream):
         stream.close()

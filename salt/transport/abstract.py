@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-TCP transport classes
-
-Wire protocol: "len(payload) msgpack({'head': SOMEHEADER, 'body': SOMEBODY})"
-
-"""
+"""Abstract transport classes"""
 
 ## Import Python Libs
 from __future__ import absolute_import, print_function, unicode_literals
@@ -82,7 +77,7 @@ log = logging.getLogger(__name__)
 # TODO: move serial down into message library
 class AbstractAsyncReqChannel(salt.transport.client.ReqChannel):
     """
-    Encapsulate sending routines to tcp.
+    Encapsulate sending routines to channel.
     Note: this class returns a singleton
     """
 
@@ -103,7 +98,7 @@ class AbstractAsyncReqChannel(salt.transport.client.ReqChannel):
         key = cls.__key(opts, **kwargs)
         obj = loop_instance_map.get(key)
         if obj is None:
-            log.debug("Initializing new AsyncTCPReqChannel for %s", key)
+            log.debug("Initializing new AbstractAsyncReqChannel for %s", key)
             # we need to make a local variable for this, as we are going to store
             # it in a WeakValueDictionary-- which will remove the item if no one
             # references it-- this forces a reference while we return to the caller
@@ -116,7 +111,7 @@ class AbstractAsyncReqChannel(salt.transport.client.ReqChannel):
         else:
             with obj._refcount_lock:
                 obj._refcount += 1
-            log.debug("Re-using AsyncTCPReqChannel for %s", key)
+            log.debug("Re-using AbstractAsyncReqChannel for %s", key)
         return obj
 
     @classmethod
@@ -336,13 +331,13 @@ class AbstractReqServerChannel(
     @salt.ext.tornado.gen.coroutine
     def process_message(self, header, payload, **kwargs):
         """
-        Handle incoming messages from underylying tcp streams
+        Handle incoming messages from underylying channel streams
         """
         try:
             try:
                 payload = self._decode_payload(payload)
             except Exception:  # pylint: disable=broad-except
-                self.write_back(
+                self.write_bytes(
                     salt.transport.frame.frame_msg("bad load", header=header),
                     **kwargs
                 )
@@ -352,7 +347,7 @@ class AbstractReqServerChannel(
             if not isinstance(payload, dict) or not isinstance(
                 payload.get("load"), dict
             ):
-                self.write_back(
+                yield self.write_bytes(
                     salt.transport.frame.frame_msg(
                         "payload and load must be a dict", header=header
                     ),
@@ -364,14 +359,14 @@ class AbstractReqServerChannel(
                 id_ = payload["load"].get("id", "")
                 if str("\0") in id_:
                     log.error("Payload contains an id with a null byte: %s", payload)
-                    self.send_back(
+                    self.write_bytes(
                         self.serial.dumps("bad load: id contains a null byte"),
                         **kwargs
                     )
                     raise salt.ext.tornado.gen.Return()
             except TypeError:
                 log.error("Payload contains non-string id: %s", payload)
-                self.send_back(
+                self.write_bytes(
                     self.serial.dumps("bad load: id {0} is not a string".format(id_)),
                     **kwargs
                 )
@@ -383,7 +378,7 @@ class AbstractReqServerChannel(
                 payload["enc"] == "clear"
                 and payload.get("load", {}).get("cmd") == "_auth"
             ):
-                self.write_back(
+                yield self.write_bytes(
                     salt.transport.frame.frame_msg(
                         self._auth(payload["load"]), header=header
                     ),
@@ -396,31 +391,31 @@ class AbstractReqServerChannel(
                 ret, req_opts = yield self.payload_handler(payload)
             except Exception as e:  # pylint: disable=broad-except
                 # always attempt to return an error to the minion
-                self.write_back(
+                self.write_bytes(
                     "Some exception handling minion payload",
                     **kwargs
                 )
                 log.error(
                     "Some exception handling a payload from minion", exc_info=True
                 )
-                self.shutdown(**kwargs)
+                self.shutdown_processor(**kwargs)
                 raise salt.ext.tornado.gen.Return()
 
             req_fun = req_opts.get("fun", "send")
             if req_fun == "send_clear":
-                self.write_back(
+                self.write_bytes(
                     salt.transport.frame.frame_msg(ret, header=header),
                     **kwargs
                 )
             elif req_fun == "send":
-                self.write_back(
+                self.write_bytes(
                     salt.transport.frame.frame_msg(
                         self.crypticle.dumps(ret), header=header
                     ),
                     **kwargs
                 )
             elif req_fun == "send_private":
-                self.write_back(
+                self.write_bytes(
                     salt.transport.frame.frame_msg(
                         self._encrypt_private(ret, req_opts["key"], req_opts["tgt"],),
                         header=header,
@@ -430,10 +425,10 @@ class AbstractReqServerChannel(
             else:
                 log.error("Unknown req_fun %s", req_fun)
                 # always attempt to return an error to the minion
-                self.write_back(
+                self.write_bytes(
                     "Server-side exception handling payload", **kwargs
                 )
-                self.shutdown(**kwargs)
+                self.shutdown_processor(**kwargs)
         except salt.ext.tornado.gen.Return:
             raise
         except Exception as exc:  # pylint: disable=broad-except
@@ -443,15 +438,43 @@ class AbstractReqServerChannel(
         raise salt.ext.tornado.gen.Return()
 
     def start_channel(self, io_loop):
+        """Start channel for minions to connect to.
+
+        Whenever a message is received process_message should be called with
+        the decoded message.
+        """
         raise NotImplemented()
 
-    def write_back(self, message, **kwargs):
+    def write_bytes(self, bpayload, **kwargs):
+        """Send bytes back to minion as response.
+
+        The kwargs provided to this function are the same start_channel passes
+        to process_message to process receieved messages.
+
+        The default implementation base64 encodes the payload, and calls
+        publish_string, for clients which cannot or will not transfer
+        binary.
+        """
+        b64payload = base64.b64encode(bpayload)
+        payload_string = b64payload.decode("ascii")
+        return self.write_string(payload_string, **kwargs)
+
+    def write_string(self, spayload, **kwargs):
+        """Send bytes back to minion as response.
+
+        The kwargs provided to this function are the same start_channel passes
+        to process_message to process receieved messages.
+
+        This must implemented assuming the write_bytes method is not.
+        """
         raise NotImplemented()
 
-    def send_back(self, message, **kwargs):
-        raise NotImplemented()
+    def shutdown_processor(self, **kwargs):
+        """Shutdown the specific minion response channel.
 
-    def shutdown(self, **kwargs):
+        The kwargs provided to this function are the same start_channel passes
+        to process_message to process receieved messages.
+        """
         pass
 
 
@@ -474,110 +497,12 @@ class AbstractAsyncPubChannel(
         if self._closing:
             return
         self._closing = True
-        if hasattr(self, "message_client"):
-            self.message_client.close()
 
     # pylint: disable=W1701
     def __del__(self):
         self.close()
 
     # pylint: enable=W1701
-
-    def _package_load(self, load):
-        return {
-            "enc": self.crypt,
-            "load": load,
-        }
-
-    @salt.ext.tornado.gen.coroutine
-    def send_id(self, tok, force_auth):
-        """
-        Send the minion id to the master so that the master may better
-        track the connection state of the minion.
-        In case of authentication errors, try to renegotiate authentication
-        and retry the method.
-        """
-        load = {"id": self.opts["id"], "tok": tok}
-
-        @salt.ext.tornado.gen.coroutine
-        def _do_transfer():
-            msg = self._package_load(self.auth.crypticle.dumps(load))
-            package = salt.transport.frame.frame_msg(msg, header=None)
-            yield self.write_to_stream(package)
-            raise salt.ext.tornado.gen.Return(True)
-
-        if force_auth or not self.auth.authenticated:
-            count = 0
-            while (
-                count <= self.opts["tcp_authentication_retries"]
-                or self.opts["tcp_authentication_retries"] < 0
-            ):
-                try:
-                    yield self.auth.authenticate()
-                    break
-                except SaltClientError as exc:
-                    log.debug(exc)
-                    count += 1
-        try:
-            ret = yield _do_transfer()
-            raise salt.ext.tornado.gen.Return(ret)
-        except salt.crypt.AuthenticationError:
-            yield self.auth.authenticate()
-            ret = yield _do_transfer()
-            raise salt.ext.tornado.gen.Return(ret)
-
-    @salt.ext.tornado.gen.coroutine
-    def connect_callback(self, result):
-        if self._closing:
-            return
-        # Force re-auth on reconnect since the master
-        # may have been restarted
-        yield self.send_id(self.tok, self._reconnected)
-        self.connected = True
-        self.event.fire_event({"master": self.opts["master"]}, "__master_connected")
-        if self._reconnected:
-            # On reconnects, fire a master event to notify that the minion is
-            # available.
-            if self.opts.get("__role") == "syndic":
-                data = "Syndic {0} started at {1}".format(
-                    self.opts["id"], time.asctime()
-                )
-                tag = salt.utils.event.tagify([self.opts["id"], "start"], "syndic")
-            else:
-                data = "Minion {0} started at {1}".format(
-                    self.opts["id"], time.asctime()
-                )
-                tag = salt.utils.event.tagify([self.opts["id"], "start"], "minion")
-            load = {
-                "id": self.opts["id"],
-                "cmd": "_minion_event",
-                "pretag": None,
-                "tok": self.tok,
-                "data": data,
-                "tag": tag,
-            }
-            req_channel = salt.utils.asynchronous.SyncWrapper(
-                self.get_async_req_channel_class(), (self.opts,)
-            )
-            try:
-                req_channel.send(load, timeout=60)
-            except salt.exceptions.SaltReqTimeoutError:
-                log.info(
-                    "fire_master failed: master could not be contacted. Request timed out."
-                )
-            except Exception:  # pylint: disable=broad-except
-                log.info("fire_master failed: %s", traceback.format_exc())
-            finally:
-                # SyncWrapper will call either close() or destroy(), whichever is available
-                del req_channel
-        else:
-            self._reconnected = True
-
-    def disconnect_callback(self):
-        if self._closing:
-            return
-        self.connected = False
-        self.event.fire_event({"master": self.opts["master"]}, "__master_disconnected")
 
     @salt.ext.tornado.gen.coroutine
     def connect(self):
@@ -617,12 +542,6 @@ class AbstractAsyncPubChannel(
             callback(ret)
 
         return self.set_callback(wrap_callback)
-
-    def write_to_stream(self, package):
-        raise NotImplemented()
-
-    def get_async_req_channel_class(self):
-        raise NotImplemented()
 
     @salt.ext.tornado.gen.coroutine
     def open_connection(self):
@@ -760,10 +679,17 @@ class AbstractPubServerChannel(salt.transport.server.PubServerChannel):
         payload_string = b64payload.decode("ascii")
         return self.publish_string(payload_string)
 
-    def start_channel(self, io_loop):
-        """Start the channel."""
+    def publish_string(self, spayload):
+        """Transfer a string to the minions.
+
+        This must implemented assuming none of the other publish_* methods are.
+        """
         raise NotImplemented()
 
-    def publish_string(self, spayload):
-        """Transfer a string to the minions."""
+    def start_channel(self, io_loop):
+        """Start channel for minions to connect to.
+
+        Whenever publish_* is called, the payload should be send to minions,
+        whom are connected.
+        """
         raise NotImplemented()
