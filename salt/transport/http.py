@@ -65,14 +65,13 @@ class AsyncHTTPReqChannel(salt.transport.abstract.AbstractAsyncReqChannel):
         post_data = {"payload": spayload}
         body = urlencode(post_data)
         http_request = salt.ext.tornado.httpclient.HTTPRequest(self.url, method="POST", headers=None, body=body)
-        print("!!", __class__, "spayload:", spayload)
 
         return_future = salt.ext.tornado.gen.Future()
         def callback(response):
             if response.error:
+                # TODO: Deal with errors
                 print("!!", __class__, "Error:", response.error)
             else:
-                print("!!", __class__, "callback:", response.body)
                 spayload = response.body
                 b64payload = spayload.decode("ascii")
                 bpayload = base64.b64decode(b64payload)
@@ -85,7 +84,6 @@ class AsyncHTTPReqChannel(salt.transport.abstract.AbstractAsyncReqChannel):
                         )
                     header = framed_msg['head']
                     payload = framed_msg['body']
-                    print("!!", __class__, "framed_msg:", framed_msg)
                     return_future.set_result(payload)
                 return
             return_future.set_result(None)
@@ -104,7 +102,6 @@ class MessageRequestHandler(salt.ext.tornado.web.RequestHandler):
 
     async def post(self):
         spayload = self.get_argument("payload")
-        print("!!", __class__, "payload:", spayload)
         b64payload = spayload.encode("ascii")
         bpayload = base64.b64decode(b64payload)
         unpacker = salt.utils.msgpack.Unpacker()
@@ -114,7 +111,6 @@ class MessageRequestHandler(salt.ext.tornado.web.RequestHandler):
                 framed_msg = salt.transport.frame.decode_embedded_strs(
                     framed_msg
                 )
-            print("!!", __class__, "framed_msg:", framed_msg)
             # header = framed_msg["head"]
             # payload = framed_msg["body"]
             self.callback(None, framed_msg, handler=self)
@@ -241,6 +237,7 @@ class AsyncHTTPPubChannel(salt.transport.abstract.AbstractAsyncPubChannel):
 
     def _handle_response(self, response):
         if response.error:
+            # TODO: Deal with errors
             print("!!", __class__, "Error:", response.error)
             if response.code == 599:
                 # Fire another long-polling request

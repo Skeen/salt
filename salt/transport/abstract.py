@@ -271,9 +271,7 @@ class AbstractAsyncReqChannel(salt.transport.client.ReqChannel):
         raise salt.ext.tornado.gen.Return(ret)
 
     def publish_dict(self, dicty, tries=3, timeout=60):
-        print("load", dicty, type(dicty))
         int_payload = self.serial.dumps(dicty)
-        print("int_payload", int_payload, type(int_payload))
         return self.publish_bytes(int_payload)
 
     def publish_bytes(self, bpayload):
